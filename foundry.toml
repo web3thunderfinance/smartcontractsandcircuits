@@ -11,4 +11,14 @@ remappings = [
     "@openzeppelin/=lib/openzeppelin-contracts/",
 ]
 
+# Etherscan v2 API Configuration for CeloScan
+[etherscan]
+alfajores = { key = "${CELOSCAN_API_KEY}", url = "https://api-alfajores.celoscan.io/api" }
+celo = { key = "${CELOSCAN_API_KEY}", url = "https://api.celoscan.io/api" }
+
+# RPC endpoints
+[rpc_endpoints]
+alfajores = "${CELO_ALFAJORES_RPC_URL}"
+celo = "${CELO_RPC_URL}"
+
 # See more config options https://github.com/foundry-rs/foundry/blob/master/crates/config/README.md#all-options

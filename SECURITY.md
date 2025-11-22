@@ -1,6 +1,6 @@
-# Web3 Thunder Finance Protocol - Security Analysis
+# Web3 Thunder Finance Mixer - Security Analysis
 
-## Contract: Web3ThunderFinanceProtocol.sol
+## Contract: Web3ThunderFinanceMixer.sol
 
 ### Version
 - Solidity: 0.8.19
@@ -313,7 +313,7 @@ if (balances[msg.sender][_token] < _amount) revert InsufficientBalance();
 
 ## Conclusion
 
-The Web3ThunderFinanceProtocol contract implements industry-standard security practices and has been designed with security as a top priority. However, **no smart contract is 100% secure**. The recommendations above should be followed before any mainnet deployment.
+The Web3ThunderFinanceMixer contract implements industry-standard security practices and has been designed with security as a top priority. However, **no smart contract is 100% secure**. The recommendations above should be followed before any mainnet deployment.
 
 ### Security Score: 8.5/10
 
