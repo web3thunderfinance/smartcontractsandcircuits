@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-pragma solidity 0.8.19;
+pragma solidity 0.8.28;
 
 import "forge-std/Test.sol";
 import "../src/Web3ThunderFinanceMixer.sol";
