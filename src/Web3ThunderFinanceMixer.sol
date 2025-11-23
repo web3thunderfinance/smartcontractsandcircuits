@@ -7,6 +7,7 @@ import "@openzeppelin/contracts/access/AccessControl.sol";
 import "@openzeppelin/contracts/security/ReentrancyGuard.sol";
 import "@openzeppelin/contracts/security/Pausable.sol";
 
+import "./interfaces/IMixerVerifier.sol";
 import "./interfaces/IAavePool.sol";
 
 /**
@@ -14,7 +15,7 @@ import "./interfaces/IAavePool.sol";
  * @author Web3 Thunder Finance Team
  * @notice Privacy-oriented yield mixer: pools deposits, supplies them to Aave, accrues yield, enables private(ish) withdrawal via commitment/nullifier.
  * @dev Prototype: NO Merkle tree, NO zk-proof verification. Do not rely on real anonymity.
- * @custom:security-contact security@web3thunderfinance.io
+ * @custom:security-contact security@web3thunder.finance
  */
 contract Web3ThunderFinanceMixer is AccessControl, ReentrancyGuard, Pausable {
     using SafeERC20 for IERC20;
@@ -24,13 +25,18 @@ contract Web3ThunderFinanceMixer is AccessControl, ReentrancyGuard, Pausable {
 
     // --- External Protocol References ---
     IAavePool public pool;            // Aave pool
+    IMixerVerifier public immutable verifier; //ZKP Verifier
+
     IERC20 public immutable token;    // Underlying asset (e.g., USDC)
     IERC20 public immutable aToken;   // Corresponding aToken accruing yield
 
     // --- Accounting ---
     uint256 public totalPrincipal;    // Sum of all active deposit principals
+    uint256 public principal;
 
-    // --- Deposit Model ---
+    mapping(uint256 => bool) public knownRoots;
+    mapping(uint256 => bool) public nullifierHashes;
+
     struct DepositInfo {
         uint256 amount;       // Principal supplied
         uint64  timestamp;    // Block timestamp of deposit
@@ -44,6 +50,10 @@ contract Web3ThunderFinanceMixer is AccessControl, ReentrancyGuard, Pausable {
     mapping(bytes32 => bool) public nullifiers;
 
     // --- Events ---
+
+    event RootRegistered(uint256 indexed root);
+
+
     /**
      * @notice Emitted when the Aave pool reference is updated.
      * @param oldPool Previously configured pool address.
@@ -61,13 +71,12 @@ contract Web3ThunderFinanceMixer is AccessControl, ReentrancyGuard, Pausable {
 
     /**
      * @notice Emitted upon successful withdrawal of principal + yield.
-     * @param commitment Commitment associated with the original deposit.
      * @param nullifier Nullifier marking the withdrawal and preventing reuse.
      * @param recipient Address receiving the withdrawn underlying.
      * @param principal Original principal returned.
      * @param yieldAmount Pro-rata yield portion distributed.
      */
-    event Withdrawn(bytes32 indexed commitment, bytes32 indexed nullifier, address indexed recipient, uint256 principal, uint256 yieldAmount);
+    event Withdrawn(bytes32 indexed nullifier, address indexed recipient, uint256 principal, uint256 yieldAmount);
 
     /**
      * @notice Emitted on emergency administrative withdrawal.
@@ -91,14 +100,16 @@ contract Web3ThunderFinanceMixer is AccessControl, ReentrancyGuard, Pausable {
      * @notice Construct mixer with immutable token & aToken addresses.
      * @param _token Underlying ERC20 asset address
      * @param _aToken Aave aToken corresponding to the underlying
+     * @param _verifier ZKP Verifier
      * @dev Pool can be set later via admin if unknown at deploy time.
      */
-    constructor(address _token, address _aToken) {
+    constructor(address _token, address _aToken, address _verifier) {
         if (_token == address(0) || _aToken == address(0)) revert ZeroAddress();
         token = IERC20(_token);
         aToken = IERC20(_aToken);
         _grantRole(DEFAULT_ADMIN_ROLE, msg.sender);
         _grantRole(ADMIN_ROLE, msg.sender);
+        verifier = IMixerVerifier(_verifier);
     }
 
     /**
@@ -111,6 +122,10 @@ contract Web3ThunderFinanceMixer is AccessControl, ReentrancyGuard, Pausable {
         address old = address(pool);
         pool = IAavePool(_pool);
         emit PoolUpdated(old, _pool);
+    }
+
+    function setPrincipal(uint256 _principal) external onlyRole(ADMIN_ROLE) {
+        principal = _principal;
     }
 
     /**
@@ -127,75 +142,92 @@ contract Web3ThunderFinanceMixer is AccessControl, ReentrancyGuard, Pausable {
      * @notice Commit a deposit with a precomputed commitment.
      * @dev Sequence: transfer underlying -> approve -> supply to pool -> record principal. Assumes non fee-on-transfer token.
      * @param commitment Off-chain keccak256(secret, amount) style hash.
-     * @param amount Amount of underlying to deposit & supply.
      */
-    function deposit(bytes32 commitment, uint256 amount) external nonReentrant whenNotPaused {
-        if (amount == 0) revert InvalidAmount();
+    function deposit(bytes32 commitment) external nonReentrant whenNotPaused {
         if (deposits[commitment].amount != 0) revert CommitmentUsed();
         if (address(pool) == address(0)) revert PoolNotSet();
 
-        token.safeTransferFrom(msg.sender, address(this), amount);
-        token.safeApprove(address(pool), amount);
-        pool.supply(address(token), amount, address(this), 0);
+        token.safeTransferFrom(msg.sender, address(this), principal);
+        token.safeApprove(address(pool), principal);
+        pool.supply(address(token), principal, address(this), 0);
 
         deposits[commitment] = DepositInfo({
-            amount: amount,
+            amount: principal,
             timestamp: uint64(block.timestamp),
             withdrawn: false
         });
-        totalPrincipal += amount;
+        totalPrincipal += principal;
 
-        emit DepositCommitted(commitment, amount, uint64(block.timestamp));
+        emit DepositCommitted(commitment, principal, uint64(block.timestamp));
     }
 
+    function registerRoot(uint256 _root) external {
+        knownRoots[_root] = true;
+        emit RootRegistered(_root);
+    }
+
+    function isSpent(uint256 _nullifierHash) external view returns (bool) {
+        return nullifierHashes[_nullifierHash];
+    }
+
+    
     /**
-     * @notice Withdraw principal plus proportional accrued yield using a nullifier.
-     * @dev Prototype (no zk-proof). Applies checks-effects-interactions order.
-     * @param commitment Commitment corresponding to original deposit.
-     * @param nullifier Unique nullifier derived from secret; prevents double-withdraw.
+     * @notice Withdraw principal plus proportional accrued yield using a nullifier and ZK proof.
+     * @dev Verifies ZK proof and nullifier before withdrawing.
+     * @param a ZK proof part a
+     * @param b ZK proof part b
+     * @param c ZK proof part c
+     * @param input Public inputs for the proof
      * @param recipient Address receiving withdrawn funds.
+     * @param root Merkle root used for the proof.
+     * @param nullifier Unique nullifier derived from secret; prevents double-withdraw.
      */
-    function withdraw(bytes32 commitment, bytes32 nullifier, address recipient) external nonReentrant whenNotPaused {
+    function withdraw(
+        uint[2] calldata a,
+        uint[2][2] calldata b,
+        uint[2] calldata c,
+        uint[3] calldata input,
+        address recipient,
+        uint256 root,
+        bytes32 nullifier) 
+    external nonReentrant whenNotPaused {
         if (recipient == address(0)) revert ZeroAddress();
-        DepositInfo storage info = deposits[commitment];
-        if (info.amount == 0) revert NotFound();
-        // Reorder checks so nullifier reuse surfaces the expected NullifierUsed error
         if (nullifiers[nullifier]) revert NullifierUsed();
-        if (info.withdrawn) revert AlreadyWithdrawn();
+        require(knownRoots[root], "Unknown root");
+        require(verifier.verifyProof(a, b, c, input), "Invalid proof");
 
         // Compute distribution BEFORE mutating totalPrincipal to ensure fair pro-rata calculation
-        (uint256 principal, uint256 yieldAmount) = _computeShare(info.amount);
+        ( , uint256 yieldAmount) = _computeShare(principal);
         uint256 totalAmount = principal + yieldAmount;
 
         // Effects
-        info.withdrawn = true;
         nullifiers[nullifier] = true;
         totalPrincipal -= principal; // subtract original principal after share calculation
 
         // Interaction
         pool.withdraw(address(token), totalAmount, recipient);
 
-        emit Withdrawn(commitment, nullifier, recipient, principal, yieldAmount);
+        emit Withdrawn(nullifier, recipient, principal, yieldAmount);
     }
 
     /**
      * @notice Preview yield share for a given principal amount.
      * @dev Uses aToken balance minus totalPrincipal to compute aggregate yield then allocates pro-rata.
-     * @param principal Deposit principal to preview.
+     * @param _principal Deposit principal to preview.
      * @return yieldAmount Current proportional yield.
      */
-    function previewYield(uint256 principal) external view returns (uint256 yieldAmount) {
-        (, uint256 y) = _computeShare(principal);
+    function previewYield(uint256 _principal) external view returns (uint256 yieldAmount) {
+        (, uint256 y) = _computeShare(_principal);
         return y;
     }
 
     /**
      * @dev Computes principal echo plus proportional yield for a given principal.
-     * @param principal Principal amount supplied.
+     * @param // _principal Principal amount supplied.
      * @return principalEcho Echo of principal.
      * @return yieldShare Pro-rata yield share; zero if no net yield.
      */
-    function _computeShare(uint256 principal) internal view returns (uint256 principalEcho, uint256 yieldShare) {
+    function _computeShare(uint256 /* _principal */) internal view returns (uint256 principalEcho, uint256 yieldShare) {
         principalEcho = principal;
         uint256 aBal = aToken.balanceOf(address(this));
         if (aBal <= totalPrincipal || totalPrincipal == 0) {
