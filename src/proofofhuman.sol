@@ -52,6 +52,16 @@ contract ProofOfHuman is SelfVerificationRoot {
         emit VerificationCompleted(output, userData);
     }
 
+    /**
+     * @notice Wrapper to perform customVerificationHook publicly
+     */
+    function performCustomVerificationHook(
+        ISelfVerificationRoot.GenericDiscloseOutputV2 memory output,
+        bytes memory userData
+    ) public {
+        customVerificationHook(output, userData);
+    }
+
     function getConfigId(
         bytes32 /* destinationChainId */,
         bytes32 /* userIdentifier */,
