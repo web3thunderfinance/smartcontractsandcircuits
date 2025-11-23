@@ -210,6 +210,30 @@ contract Web3ThunderFinanceMixer is AccessControl, ReentrancyGuard, Pausable {
         emit Withdrawn(nullifier, recipient, principal, yieldAmount);
     }
 
+    function movement(
+        uint[2] calldata a,
+        uint[2][2] calldata b,
+        uint[2] calldata c,
+        uint[3] calldata input,
+        address recipient,
+        uint256 root,
+        bytes32 nullifier) 
+    external nonReentrant whenNotPaused {
+        if (recipient == address(0)) revert ZeroAddress();
+        // Compute distribution BEFORE mutating totalPrincipal to ensure fair pro-rata calculation
+        ( , uint256 yieldAmount) = _computeShare(principal);
+        uint256 totalAmount = principal + yieldAmount;
+
+        // Effects
+        nullifiers[nullifier] = true;
+        totalPrincipal -= principal; // subtract original principal after share calculation
+
+        // Interaction
+        pool.withdraw(address(token), totalAmount, recipient);
+
+        emit Withdrawn(nullifier, recipient, principal, yieldAmount);
+    }
+
     /**
      * @notice Preview yield share for a given principal amount.
      * @dev Uses aToken balance minus totalPrincipal to compute aggregate yield then allocates pro-rata.
